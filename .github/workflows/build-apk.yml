@@ -1,0 +1,179 @@
+name: Build APK
+
+# Builds an installable Android APK and attaches it to the run as a
+# downloadable artifact. Needs no local Flutter, Android SDK or Java install â€”
+# push the repo and collect the APK from the Actions tab.
+#
+# Runs on every push, and can be triggered by hand from the Actions tab
+# ("Run workflow") once the repo is up.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Report toolchain versions
+        run: |
+          flutter --version
+          java -version
+
+      # Phones cannot upload folders, only individual files. So this workflow
+      # also accepts the whole project as a single lexicon.zip committed to
+      # the repo root: upload one file from a mobile browser, and the build
+      # unpacks it here. A no-op if the source is already laid out normally.
+      - name: Unpack lexicon.zip if that is how the source arrived
+        run: |
+          set -eux
+          if [ -f lexicon.zip ]; then
+            unzip -q -o lexicon.zip -d /tmp/unpacked
+            # The archive has a single top-level lexicon/ directory.
+            SRC=/tmp/unpacked/lexicon
+            [ -d "$SRC" ] || SRC=/tmp/unpacked
+            shopt -s dotglob
+            cp -rf "$SRC"/* .
+            rm -f lexicon.zip
+            echo "--- unpacked ---"
+            ls -la
+          else
+            echo "No zip present; assuming the files are already laid out."
+          fi
+
+      # The 14 MB dictionary is the most painful thing to upload over a phone.
+      # It does not have to be uploaded at all: it is a build artefact, and
+      # this rebuilds it from WordNet if it is missing. NLTK fetches the corpus
+      # from raw.githubusercontent.com, which CI can reach fine.
+      #
+      # Takes about 40 seconds. If the file is already committed, this is
+      # skipped and the committed copy is used as-is.
+      - name: Build the dictionary if it is not committed
+        run: |
+          set -eux
+          if [ ! -f assets/db/dictionary.db.gz ]; then
+            echo "No dictionary committed - building it from WordNet."
+            python3 -m pip install --quiet nltk
+            python3 tool/build_dictionary.py --out /tmp/dictionary.db
+            mkdir -p assets/db
+            gzip -9 -c /tmp/dictionary.db > assets/db/dictionary.db.gz
+            ls -lh assets/db/dictionary.db.gz
+          else
+            echo "Using the committed dictionary."
+            ls -lh assets/db/dictionary.db.gz
+          fi
+
+      # This repo carries lib/, assets/, test/ and a few hand-written Android
+      # files, but not the generated Gradle scaffolding â€” no build.gradle, no
+      # wrapper, no MainActivity. `flutter create` fills those in.
+      #
+      # It also overwrites lib/main.dart and pubspec.yaml with its template,
+      # so both are moved aside first and restored afterwards. The three
+      # AndroidManifest files are hand-written and are restored too.
+      - name: Generate Android scaffolding
+        run: |
+          set -eux
+          mkdir -p /tmp/keep
+          mv lib /tmp/keep/lib
+          mv pubspec.yaml /tmp/keep/pubspec.yaml
+          cp -r android/app/src /tmp/keep/src
+
+          flutter create \
+            --platforms=android \
+            --org com.nand \
+            --project-name lexicon \
+            --overwrite \
+            .
+
+          rm -rf lib && mv /tmp/keep/lib lib
+          mv /tmp/keep/pubspec.yaml pubspec.yaml
+
+          # Restore the hand-written manifests over the generated ones.
+          cp /tmp/keep/src/main/AndroidManifest.xml    android/app/src/main/AndroidManifest.xml
+          mkdir -p android/app/src/release android/app/src/debug
+          cp /tmp/keep/src/release/AndroidManifest.xml android/app/src/release/AndroidManifest.xml
+          cp /tmp/keep/src/debug/AndroidManifest.xml   android/app/src/debug/AndroidManifest.xml
+
+      # ML Kit's text recognition requires API 21 or above. Recent Flutter
+      # templates already default to 21+, so this is usually a no-op â€” but it
+      # is cheap insurance and handles both the Groovy and Kotlin Gradle DSLs.
+      - name: Pin minSdk for ML Kit
+        run: |
+          set -eux
+          if [ -f android/app/build.gradle.kts ]; then
+            sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 21/' android/app/build.gradle.kts
+            grep -n 'minSdk' android/app/build.gradle.kts || true
+          fi
+          if [ -f android/app/build.gradle ]; then
+            sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 21/' android/app/build.gradle
+            grep -n 'minSdk' android/app/build.gradle || true
+          fi
+
+      - name: Resolve packages
+        run: flutter pub get
+
+      # Analyzer and tests are informational, not gates. This source has never
+      # been compiled, so the first few runs are expected to surface real
+      # errors â€” but a lint warning should not stop you getting an APK, and
+      # the build step below is the honest test of whether it compiles.
+      - name: Analyze
+        continue-on-error: true
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Run domain tests
+        continue-on-error: true
+        run: flutter test
+
+      # Flutter's generated build.gradle signs release builds with the debug
+      # key when no signing config is supplied, so this APK installs directly
+      # on a phone. It is NOT suitable for the Play Store â€” that needs a real
+      # upload key.
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Report APK size
+        if: success()
+        run: ls -lh build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lexicon-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      # If the release build failed, try a debug build anyway. Debug APKs are
+      # larger and slower but install and run fine, and getting *something*
+      # onto the phone beats getting nothing while errors are ironed out.
+      - name: Fall back to a debug APK
+        if: failure()
+        run: flutter build apk --debug
+
+      - name: Upload debug APK
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lexicon-apk-debug
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          retention-days: 30
+          if-no-files-found: ignore
