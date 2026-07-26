@@ -38,26 +38,67 @@ jobs:
           flutter --version
           java -version
 
-      # Phones cannot upload folders, only individual files. So this workflow
-      # also accepts the whole project as a single lexicon.zip committed to
-      # the repo root: upload one file from a mobile browser, and the build
-      # unpacks it here. A no-op if the source is already laid out normally.
-      - name: Unpack lexicon.zip if that is how the source arrived
+      - name: Show what actually arrived in the repo
+        run: ls -la
+
+      # Phones cannot upload folders, only individual files, so this workflow
+      # accepts the whole project as a zip committed to the repo root.
+      #
+      # It matches ANY *.zip rather than one hard-coded name. An earlier
+      # version looked for "lexicon.zip" specifically and silently did nothing
+      # when the file was called "lexicon-lite.zip" -- every later step then
+      # failed with a confusing "No pubspec.yaml" instead of pointing at the
+      # real problem.
+      - name: Unpack the project zip
         run: |
           set -eux
-          if [ -f lexicon.zip ]; then
-            unzip -q -o lexicon.zip -d /tmp/unpacked
-            # The archive has a single top-level lexicon/ directory.
-            SRC=/tmp/unpacked/lexicon
-            [ -d "$SRC" ] || SRC=/tmp/unpacked
+          ZIP=$(find . -maxdepth 1 -name '*.zip' | head -1)
+
+          if [ -n "$ZIP" ]; then
+            echo "Unpacking $ZIP"
+            unzip -q -o "$ZIP" -d /tmp/unpacked
+
+            # The archive may or may not have a single top-level folder.
+            if [ -f /tmp/unpacked/pubspec.yaml ]; then
+              SRC=/tmp/unpacked
+            else
+              SRC=$(find /tmp/unpacked -maxdepth 2 -name pubspec.yaml \
+                    -exec dirname {} \; | head -1)
+            fi
+
+            if [ -z "$SRC" ]; then
+              echo "::error::No pubspec.yaml anywhere inside $ZIP."
+              find /tmp/unpacked -maxdepth 3 | head -50
+              exit 1
+            fi
+
+            echo "Project root inside the archive: $SRC"
             shopt -s dotglob
             cp -rf "$SRC"/* .
-            rm -f lexicon.zip
-            echo "--- unpacked ---"
-            ls -la
+            rm -f "$ZIP"
           else
-            echo "No zip present; assuming the files are already laid out."
+            echo "No zip found; assuming the files are already laid out."
           fi
+
+      # Fail here with a clear message rather than three steps later with a
+      # misleading one.
+      - name: Verify the project is present
+        run: |
+          set -eu
+          missing=0
+          for required in pubspec.yaml lib/main.dart tool/build_dictionary.py; do
+            if [ ! -e "$required" ]; then
+              echo "::error::Missing $required"
+              missing=1
+            fi
+          done
+          if [ "$missing" = "1" ]; then
+            echo "--- repo root ---"; ls -la
+            echo "::error::Project files are not in place. Upload the zip to the repo root, or commit the folder contents directly."
+            exit 1
+          fi
+          echo "Project layout looks correct."
+          ls -la
 
       # The 14 MB dictionary is the most painful thing to upload over a phone.
       # It does not have to be uploaded at all: it is a build artefact, and
@@ -81,36 +122,41 @@ jobs:
             ls -lh assets/db/dictionary.db.gz
           fi
 
-      # This repo carries lib/, assets/, test/ and a few hand-written Android
-      # files, but not the generated Gradle scaffolding â€” no build.gradle, no
-      # wrapper, no MainActivity. `flutter create` fills those in.
+      # This repo carries lib/, assets/, test/ and three hand-written Android
+      # manifests, but not the generated Gradle scaffolding -- no build.gradle,
+      # no wrapper, no MainActivity. `flutter create` produces those.
       #
-      # It also overwrites lib/main.dart and pubspec.yaml with its template,
-      # so both are moved aside first and restored afterwards. The three
-      # AndroidManifest files are hand-written and are restored too.
+      # It is run into a TEMPORARY directory and only the android/ folder is
+      # copied back. An earlier version ran it in place and moved lib/ and
+      # pubspec.yaml aside first, which meant that if `flutter create` failed
+      # the project was left gutted and every later step failed confusingly.
+      # Scaffolding out-of-tree cannot damage the source at all.
       - name: Generate Android scaffolding
         run: |
           set -eux
-          mkdir -p /tmp/keep
-          mv lib /tmp/keep/lib
-          mv pubspec.yaml /tmp/keep/pubspec.yaml
-          cp -r android/app/src /tmp/keep/src
-
+          rm -rf /tmp/scaffold
           flutter create \
             --platforms=android \
             --org com.nand \
             --project-name lexicon \
-            --overwrite \
-            .
+            /tmp/scaffold
 
-          rm -rf lib && mv /tmp/keep/lib lib
-          mv /tmp/keep/pubspec.yaml pubspec.yaml
+          # Keep the hand-written manifests, take everything else from the
+          # generated project.
+          mkdir -p /tmp/manifests
+          cp -r android/app/src/. /tmp/manifests/ 2>/dev/null || true
 
-          # Restore the hand-written manifests over the generated ones.
-          cp /tmp/keep/src/main/AndroidManifest.xml    android/app/src/main/AndroidManifest.xml
-          mkdir -p android/app/src/release android/app/src/debug
-          cp /tmp/keep/src/release/AndroidManifest.xml android/app/src/release/AndroidManifest.xml
-          cp /tmp/keep/src/debug/AndroidManifest.xml   android/app/src/debug/AndroidManifest.xml
+          rm -rf android
+          cp -r /tmp/scaffold/android .
+
+          for variant in main release debug; do
+            if [ -f "/tmp/manifests/$variant/AndroidManifest.xml" ]; then
+              mkdir -p "android/app/src/$variant"
+              cp "/tmp/manifests/$variant/AndroidManifest.xml" \
+                 "android/app/src/$variant/AndroidManifest.xml"
+              echo "restored $variant manifest"
+            fi
+          done
 
       # ML Kit's text recognition requires API 21 or above. Recent Flutter
       # templates already default to 21+, so this is usually a no-op â€” but it
@@ -167,7 +213,16 @@ jobs:
       # onto the phone beats getting nothing while errors are ironed out.
       - name: Fall back to a debug APK
         if: failure()
-        run: flutter build apk --debug
+        run: |
+          # Only meaningful if the project actually got as far as being a
+          # project. Running this blind is what produced the misleading
+          # "No pubspec.yaml file found" error that masked the real cause.
+          if [ ! -f pubspec.yaml ]; then
+            echo "::warning::Skipping the debug build - there is no Flutter project here."
+            echo "::warning::The failure happened before the build stage. Check the earlier red step."
+            exit 0
+          fi
+          flutter build apk --debug
 
       - name: Upload debug APK
         if: failure()
