@@ -141,13 +141,19 @@ jobs:
             --project-name lexicon \
             /tmp/scaffold
 
-          # Keep the hand-written manifests, take everything else from the
-          # generated project.
+          # Keep the hand-written manifests and R8 rules, take everything else
+          # from the generated project.
           mkdir -p /tmp/manifests
           cp -r android/app/src/. /tmp/manifests/ 2>/dev/null || true
+          cp android/app/proguard-rules.pro /tmp/proguard-rules.pro 2>/dev/null || true
 
           rm -rf android
           cp -r /tmp/scaffold/android .
+
+          if [ -f /tmp/proguard-rules.pro ]; then
+            cp /tmp/proguard-rules.pro android/app/proguard-rules.pro
+            echo "restored proguard-rules.pro"
+          fi
 
           for variant in main release debug; do
             if [ -f "/tmp/manifests/$variant/AndroidManifest.xml" ]; then
@@ -180,6 +186,31 @@ jobs:
       #
       # It also cannot be covered by a unit test: a file with this error does
       # not compile, so the test would never run.
+      # R8 aborts on the four ML Kit script classes this app deliberately does
+      # not bundle. android/app/proguard-rules.pro explains why in full; this
+      # step points the release build at it.
+      #
+      # The Gradle snippet lives in tool/gradle/ rather than inline here,
+      # because a shell heredoc inside a YAML block scalar has to be indented
+      # to satisfy YAML and un-indented to satisfy the heredoc terminator.
+      # Keeping it in a file sidesteps that entirely.
+      - name: Wire R8 rules into the release build
+        run: |
+          set -eux
+          if [ -f android/app/build.gradle.kts ]; then
+            cat tool/gradle/r8-release.gradle.kts >> android/app/build.gradle.kts
+            tail -14 android/app/build.gradle.kts
+          elif [ -f android/app/build.gradle ]; then
+            cat tool/gradle/r8-release.gradle >> android/app/build.gradle
+            tail -10 android/app/build.gradle
+          else
+            echo "::error::No app-level Gradle build file found."
+            ls -la android/app/
+            exit 1
+          fi
+          test -f android/app/proguard-rules.pro \
+            || { echo "::error::proguard-rules.pro missing"; exit 1; }
+
       - name: Check const collections for duplicates
         run: python3 tool/check_const_collections.py
 
