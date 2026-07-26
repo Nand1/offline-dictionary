@@ -173,6 +173,16 @@ jobs:
             grep -n 'minSdk' android/app/build.gradle || true
           fi
 
+      # A duplicate element in a const Set is a hard compile error in Dart,
+      # and the compiler reports only the FIRST one it finds -- so a list with
+      # three duplicates costs three full Gradle rounds at ~4 minutes each.
+      # This finds all of them in under a second, before Gradle ever starts.
+      #
+      # It also cannot be covered by a unit test: a file with this error does
+      # not compile, so the test would never run.
+      - name: Check const collections for duplicates
+        run: python3 tool/check_const_collections.py
+
       - name: Resolve packages
         run: flutter pub get
 
