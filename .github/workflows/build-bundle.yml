@@ -198,31 +198,38 @@ jobs:
             exit 1
           fi
 
-          # Check 3: is the key readable with the store password?
+          # Check 3: can the PRIVATE KEY actually be decrypted?
           #
-          # Worth knowing: modern keystores are PKCS12, which does NOT support
-          # a separate per-key password. keytool prints "Different store and
-          # key passwords not supported for PKCS12 KeyStores" and ignores
-          # -keypass entirely. So for any keystore made by a current JDK, the
-          # key password IS the store password.
+          # This is the check that matters, and the one an earlier version got
+          # wrong. `keytool -list -alias X` succeeds using the STORE password
+          # alone, so it happily passes while the KEY password is wrong. The
+          # failure then surfaces six minutes later as:
           #
-          # Practical consequence: if signing complains about the key
-          # password, set KEY_PASSWORD to the same value as KEYSTORE_PASSWORD.
-          if ! keytool -list -keystore android/app/upload-keystore.jks \
+          #     Failed to read key *** from store: Cannot recover key
+          #
+          # `-certreq` actually signs a certificate request with the private
+          # key, so it must decrypt it. It is read-only — it does not modify
+          # the keystore — and it reproduces the exact error above in seconds.
+          #
+          # Background: JKS keystores have independent store and key
+          # passwords. PKCS12 (the modern default) has only one and ignores
+          # -keypass entirely. So this matters mainly for JKS keystores, which
+          # is what `-storetype JKS` or an older JDK produces.
+          if ! keytool -certreq \
+               -keystore android/app/upload-keystore.jks \
                -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
-               -alias "${{ secrets.KEY_ALIAS }}" >/dev/null 2>&1; then
-            echo "::error::The alias exists but could not be read from the keystore."
-            exit 1
-          fi
+               -alias "${{ secrets.KEY_ALIAS }}" \
+               -keypass "${{ secrets.KEY_PASSWORD }}" >/dev/null 2>&1; then
 
-          # Warn if the two password secrets differ, since on PKCS12 only the
-          # store password is actually used.
-          if [ "${{ secrets.KEY_PASSWORD }}" != "${{ secrets.KEYSTORE_PASSWORD }}" ]; then
             STORETYPE=$(keytool -list -keystore android/app/upload-keystore.jks \
                         -storepass "${{ secrets.KEYSTORE_PASSWORD }}" 2>/dev/null \
                         | grep -i "Keystore type" | head -1)
-            echo "::warning::KEY_PASSWORD differs from KEYSTORE_PASSWORD. $STORETYPE — PKCS12 keystores ignore separate key passwords. If signing fails, set both secrets to the same value."
+
+            echo "::error::Could not decrypt the private key — this is the 'Cannot recover key' failure. The KEY_PASSWORD secret is wrong. $STORETYPE"
+            echo "::error::JKS keystores have a separate key password from the store password. If you set them to the same value when running keytool, set KEY_PASSWORD to the same value as KEYSTORE_PASSWORD. If you used -keypass with a different value, use that value."
+            exit 1
           fi
+          echo "Private key decrypts correctly."
 
           # printf rather than a heredoc: a heredoc inside a YAML block
           # scalar writes the YAML indentation into the file, so every line
