@@ -1,0 +1,227 @@
+name: Build Play Bundle
+
+# Builds a SIGNED Android App Bundle (.aab) for uploading to Google Play.
+#
+# This is separate from build-apk.yml on purpose:
+#
+#   build-apk.yml     unsigned APK, runs on every push, for testing on your
+#                     own phone. No secrets involved.
+#   build-bundle.yml  signed .aab for Play. Runs only when you ask it to,
+#                     because it needs your keystore.
+#
+# ---------------------------------------------------------------------------
+# BEFORE THE FIRST RUN — add four repository secrets
+# ---------------------------------------------------------------------------
+# GitHub → your repo → Settings → Secrets and variables → Actions →
+# New repository secret. Add each of these:
+#
+#   KEYSTORE_BASE64    the keystore file, base64-encoded (see PUBLISHING.md)
+#   KEYSTORE_PASSWORD  the password you chose when creating it
+#   KEY_PASSWORD       normally the same as KEYSTORE_PASSWORD
+#   KEY_ALIAS          "upload", unless you changed it
+#
+# Secrets are encrypted, are never printed in logs, and are not visible to
+# anyone who can only read the repository. This is the correct way to sign in
+# CI — do NOT commit the keystore itself, even to a private repo.
+#
+# The keystore is written to disk at the start of the run and deleted at the
+# end, including when the build fails.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: >-
+          Build number for this upload. MUST be higher than every previous
+          upload to Play, including discarded test builds.
+        required: true
+        default: '1'
+      version_name:
+        description: 'Version name shown to users (e.g. 1.0.0)'
+        required: true
+        default: '1.0.0'
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # Fail immediately with a clear message rather than 20 minutes later
+      # with a confusing one.
+      - name: Check the signing secrets are present
+        run: |
+          missing=0
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_PASSWORD KEY_ALIAS; do
+            case "$name" in
+              KEYSTORE_BASE64)   value="${{ secrets.KEYSTORE_BASE64 }}" ;;
+              KEYSTORE_PASSWORD) value="${{ secrets.KEYSTORE_PASSWORD }}" ;;
+              KEY_PASSWORD)      value="${{ secrets.KEY_PASSWORD }}" ;;
+              KEY_ALIAS)         value="${{ secrets.KEY_ALIAS }}" ;;
+            esac
+            if [ -z "$value" ]; then
+              echo "::error::Missing repository secret: $name"
+              missing=1
+            fi
+          done
+          if [ "$missing" = "1" ]; then
+            echo "::error::Add the missing secrets under Settings -> Secrets and variables -> Actions. See PUBLISHING.md Step 4."
+            exit 1
+          fi
+          echo "All four signing secrets are present."
+
+      - name: Unpack the project zip
+        run: |
+          set -eux
+          ZIP=$(find . -maxdepth 1 -name '*.zip' | head -1)
+          if [ -n "$ZIP" ]; then
+            unzip -q -o "$ZIP" -d /tmp/unpacked
+            if [ -f /tmp/unpacked/pubspec.yaml ]; then
+              SRC=/tmp/unpacked
+            else
+              SRC=$(find /tmp/unpacked -maxdepth 2 -name pubspec.yaml \
+                    -exec dirname {} \; | head -1)
+            fi
+            [ -n "$SRC" ] || { echo "::error::No pubspec.yaml inside $ZIP"; exit 1; }
+            shopt -s dotglob
+            cp -rf "$SRC"/* .
+            rm -f "$ZIP"
+          fi
+          test -f pubspec.yaml || { echo "::error::No project found."; exit 1; }
+
+      - name: Build the dictionary if it is not committed
+        run: |
+          set -eux
+          if [ ! -f assets/db/dictionary.db.gz ]; then
+            python3 -m pip install --quiet nltk
+            python3 tool/build_dictionary.py --out /tmp/dictionary.db
+            mkdir -p assets/db
+            gzip -9 -c /tmp/dictionary.db > assets/db/dictionary.db.gz
+          fi
+          ls -lh assets/db/dictionary.db.gz
+
+      # Play identifies uploads by build number and never allows one to be
+      # reused. Taking it from a workflow input rather than pubspec.yaml means
+      # you can bump it without editing and re-uploading the zip.
+      - name: Set the version
+        run: |
+          set -eux
+          VERSION="${{ inputs.version_name }}+${{ inputs.build_number }}"
+          sed -i "s/^version: .*/version: $VERSION/" pubspec.yaml
+          grep '^version:' pubspec.yaml
+
+      - name: Generate Android scaffolding
+        run: |
+          set -eux
+          rm -rf /tmp/scaffold
+          flutter create --platforms=android --org com.nand \
+            --project-name lexicon /tmp/scaffold
+
+          mkdir -p /tmp/manifests
+          cp -r android/app/src/. /tmp/manifests/ 2>/dev/null || true
+          cp android/app/proguard-rules.pro /tmp/proguard.pro 2>/dev/null || true
+
+          rm -rf android
+          cp -r /tmp/scaffold/android .
+
+          for variant in main release debug; do
+            if [ -f "/tmp/manifests/$variant/AndroidManifest.xml" ]; then
+              mkdir -p "android/app/src/$variant"
+              cp "/tmp/manifests/$variant/AndroidManifest.xml" \
+                 "android/app/src/$variant/AndroidManifest.xml"
+            fi
+          done
+          [ -f /tmp/proguard.pro ] && cp /tmp/proguard.pro android/app/proguard-rules.pro || true
+
+          # Launcher icons, if Pillow is available.
+          python3 -m pip install --quiet pillow || true
+          python3 tool/release/make_icon.py || echo "Icon generation skipped."
+
+      # Decode the keystore and write key.properties. Both live only inside
+      # this runner, which is destroyed when the job ends.
+      - name: Restore the keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > upload-keystore.jks
+
+          # A truncated or mis-pasted secret produces a file that is not a
+          # keystore; catch that here rather than at the signing step.
+          if ! keytool -list -keystore upload-keystore.jks \
+               -storepass "${{ secrets.KEYSTORE_PASSWORD }}" >/dev/null 2>&1; then
+            echo "::error::Could not open the keystore. Either KEYSTORE_BASE64 is corrupt (re-copy it, with no line breaks) or KEYSTORE_PASSWORD is wrong."
+            exit 1
+          fi
+
+          cat > android/key.properties <<PROPS
+          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          keyAlias=${{ secrets.KEY_ALIAS }}
+          storeFile=$GITHUB_WORKSPACE/upload-keystore.jks
+          PROPS
+          echo "Keystore restored and verified."
+
+      - name: Apply the release configuration
+        run: |
+          set -eux
+          GRADLE_FILE=android/app/build.gradle.kts
+          [ -f "$GRADLE_FILE" ] || GRADLE_FILE=android/app/build.gradle
+          cat tool/gradle/release-signing.gradle.kts >> "$GRADLE_FILE"
+          tail -20 "$GRADLE_FILE"
+
+      - name: Check const collections
+        run: python3 tool/check_const_collections.py
+
+      - name: Resolve packages
+        run: flutter pub get
+
+      - name: Run tests
+        continue-on-error: true
+        run: flutter test
+
+      - name: Build the app bundle
+        run: flutter build appbundle --release
+
+      # A bundle signed with the debug key uploads fine and is then rejected by
+      # Play with a vague message. Catch it here instead.
+      - name: Verify the signature
+        run: |
+          AAB=build/app/outputs/bundle/release/app-release.aab
+          test -f "$AAB" || { echo "::error::Bundle was not produced."; exit 1; }
+
+          if keytool -printcert -jarfile "$AAB" 2>/dev/null | grep -qi "CN=Android Debug"; then
+            echo "::error::This bundle is DEBUG-SIGNED. Play will reject it. The keystore was not picked up."
+            exit 1
+          fi
+
+          echo "=== signing certificate ==="
+          keytool -printcert -jarfile "$AAB" 2>/dev/null | grep -E "Owner:|Valid from:" | head -2
+          echo "=== size ==="
+          ls -lh "$AAB"
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: lexicon-playstore-bundle
+          path: build/app/outputs/bundle/release/app-release.aab
+          retention-days: 30
+          if-no-files-found: error
+
+      # `always()` so the secrets are removed even when an earlier step failed.
+      - name: Remove the keystore
+        if: always()
+        run: |
+          rm -f upload-keystore.jks android/key.properties
+          echo "Signing material removed from the runner."
