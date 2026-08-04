@@ -153,16 +153,67 @@ jobs:
 
       # Decode the keystore and write key.properties. Both live only inside
       # this runner, which is destroyed when the job ends.
+      # Decode the keystore and write key.properties. Both live only inside
+      # this runner, which is destroyed when the job ends.
       - name: Restore the keystore
         run: |
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > upload-keystore.jks
 
-          # A truncated or mis-pasted secret produces a file that is not a
-          # keystore; catch that here rather than at the signing step.
+          # Check 1: is this a keystore at all, and is the password right?
           if ! keytool -list -keystore upload-keystore.jks \
                -storepass "${{ secrets.KEYSTORE_PASSWORD }}" >/dev/null 2>&1; then
-            echo "::error::Could not open the keystore. Either KEYSTORE_BASE64 is corrupt (re-copy it, with no line breaks) or KEYSTORE_PASSWORD is wrong."
+            echo "::error::Could not open the keystore. Either KEYSTORE_BASE64 is corrupt (re-copy it with base64 -w 0, no line breaks) or KEYSTORE_PASSWORD is wrong."
             exit 1
+          fi
+
+          # Check 2: does the alias in KEY_ALIAS actually exist inside it?
+          #
+          # This is the failure that cost a six-minute build: the keystore
+          # opened fine, Gradle compiled everything, and only the final
+          # signing task discovered the alias was wrong. GitHub masks secret
+          # values in logs as ***, so the error could not even name the alias
+          # it was looking for.
+          #
+          # keytool -list prints every alias. Comparing here means a mismatch
+          # costs seconds instead of six minutes, and the log can show which
+          # aliases DO exist without revealing the secret.
+          ALIASES=$(keytool -list -keystore upload-keystore.jks \
+                    -storepass "${{ secrets.KEYSTORE_PASSWORD }}" 2>/dev/null \
+                    | grep -i "PrivateKeyEntry\|trustedCertEntry" \
+                    | sed 's/,.*//' | tr -d ' ')
+
+          echo "Aliases found in the keystore:"
+          echo "$ALIASES" | sed 's/^/    /'
+
+          if ! echo "$ALIASES" | grep -qix "${{ secrets.KEY_ALIAS }}"; then
+            echo "::error::The KEY_ALIAS secret does not match any alias in the keystore. The aliases actually present are listed above — set KEY_ALIAS to one of them (it is case-sensitive), or regenerate the keystore with -alias upload."
+            exit 1
+          fi
+
+          # Check 3: is the key readable with the store password?
+          #
+          # Worth knowing: modern keystores are PKCS12, which does NOT support
+          # a separate per-key password. keytool prints "Different store and
+          # key passwords not supported for PKCS12 KeyStores" and ignores
+          # -keypass entirely. So for any keystore made by a current JDK, the
+          # key password IS the store password.
+          #
+          # Practical consequence: if signing complains about the key
+          # password, set KEY_PASSWORD to the same value as KEYSTORE_PASSWORD.
+          if ! keytool -list -keystore upload-keystore.jks \
+               -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+               -alias "${{ secrets.KEY_ALIAS }}" >/dev/null 2>&1; then
+            echo "::error::The alias exists but could not be read from the keystore."
+            exit 1
+          fi
+
+          # Warn if the two password secrets differ, since on PKCS12 only the
+          # store password is actually used.
+          if [ "${{ secrets.KEY_PASSWORD }}" != "${{ secrets.KEYSTORE_PASSWORD }}" ]; then
+            STORETYPE=$(keytool -list -keystore upload-keystore.jks \
+                        -storepass "${{ secrets.KEYSTORE_PASSWORD }}" 2>/dev/null \
+                        | grep -i "Keystore type" | head -1)
+            echo "::warning::KEY_PASSWORD differs from KEYSTORE_PASSWORD. $STORETYPE — PKCS12 keystores ignore separate key passwords. If signing fails, set both secrets to the same value."
           fi
 
           cat > android/key.properties <<PROPS
@@ -171,7 +222,8 @@ jobs:
           keyAlias=${{ secrets.KEY_ALIAS }}
           storeFile=$GITHUB_WORKSPACE/upload-keystore.jks
           PROPS
-          echo "Keystore restored and verified."
+
+          echo "Keystore restored, alias verified, key readable."
 
       # Configures signing, SDK levels and minification by EDITING the
       # generated build.gradle.kts, not by appending a second android { }
