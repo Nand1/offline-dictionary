@@ -188,13 +188,18 @@ jobs:
           [ -f "$GRADLE_FILE" ] || GRADLE_FILE=android/app/build.gradle
 
           # Guard against appending twice, which would configure the release
-          # buildType two ways and fail confusingly.
-          if grep -q 'signingConfigs' "$GRADLE_FILE"; then
-            echo "::error::Release config already present in $GRADLE_FILE."
-            exit 1
+          # buildType two ways.
+          #
+          # Match a marker unique to THIS snippet, not a generic Gradle
+          # keyword. Recent Flutter templates already ship their own
+          # `signingConfigs` block for the debug fallback, so checking for
+          # that string aborted on a freshly generated file — before anything
+          # had been appended at all.
+          if grep -q 'LEXICON_RELEASE_CONFIG' "$GRADLE_FILE"; then
+            echo "Release config already applied; skipping."
+          else
+            cat tool/gradle/release-signing.gradle.kts >> "$GRADLE_FILE"
           fi
-
-          cat tool/gradle/release-signing.gradle.kts >> "$GRADLE_FILE"
 
           # Fail here, with the offending lines visible, rather than deep in a
           # Gradle stack trace.
