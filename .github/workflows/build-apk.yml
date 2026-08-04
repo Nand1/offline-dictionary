@@ -167,49 +167,16 @@ jobs:
       # ML Kit's text recognition requires API 21 or above. Recent Flutter
       # templates already default to 21+, so this is usually a no-op — but it
       # is cheap insurance and handles both the Groovy and Kotlin Gradle DSLs.
-      - name: Pin minSdk for ML Kit
+      # Same patcher the bundle workflow uses, so the APK and the Play
+      # bundle are configured identically. It edits build.gradle.kts in place
+      # rather than appending a second android { } block -- see the comments
+      # in tool/gradle/patch_gradle.py for the three failures that led there.
+      - name: Configure the build
         run: |
           set -eux
-          if [ -f android/app/build.gradle.kts ]; then
-            sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 21/' android/app/build.gradle.kts
-            grep -n 'minSdk' android/app/build.gradle.kts || true
-          fi
-          if [ -f android/app/build.gradle ]; then
-            sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 21/' android/app/build.gradle
-            grep -n 'minSdk' android/app/build.gradle || true
-          fi
-
-      # A duplicate element in a const Set is a hard compile error in Dart,
-      # and the compiler reports only the FIRST one it finds -- so a list with
-      # three duplicates costs three full Gradle rounds at ~4 minutes each.
-      # This finds all of them in under a second, before Gradle ever starts.
-      #
-      # It also cannot be covered by a unit test: a file with this error does
-      # not compile, so the test would never run.
-      # R8 aborts on the four ML Kit script classes this app deliberately does
-      # not bundle. android/app/proguard-rules.pro explains why in full; this
-      # step points the release build at it.
-      #
-      # The Gradle snippet lives in tool/gradle/ rather than inline here,
-      # because a shell heredoc inside a YAML block scalar has to be indented
-      # to satisfy YAML and un-indented to satisfy the heredoc terminator.
-      # Keeping it in a file sidesteps that entirely.
-      - name: Wire R8 rules into the release build
-        run: |
-          set -eux
-          if [ -f android/app/build.gradle.kts ]; then
-            cat tool/gradle/r8-release.gradle.kts >> android/app/build.gradle.kts
-            tail -14 android/app/build.gradle.kts
-          elif [ -f android/app/build.gradle ]; then
-            cat tool/gradle/r8-release.gradle >> android/app/build.gradle
-            tail -10 android/app/build.gradle
-          else
-            echo "::error::No app-level Gradle build file found."
-            ls -la android/app/
-            exit 1
-          fi
-          test -f android/app/proguard-rules.pro \
-            || { echo "::error::proguard-rules.pro missing"; exit 1; }
+          python3 tool/gradle/patch_gradle.py
+          echo "=== resulting build.gradle.kts ==="
+          cat -n android/app/build.gradle.kts
 
       - name: Check const collections for duplicates
         run: python3 tool/check_const_collections.py
