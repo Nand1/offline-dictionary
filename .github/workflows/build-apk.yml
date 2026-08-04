@@ -1,7 +1,7 @@
 name: Build APK
 
 # Builds an installable Android APK and attaches it to the run as a
-# downloadable artifact. Needs no local Flutter, Android SDK or Java install â€”
+# downloadable artifact. Needs no local Flutter, Android SDK or Java install —
 # push the repo and collect the APK from the Actions tab.
 #
 # Runs on every push, and can be triggered by hand from the Actions tab
@@ -165,7 +165,7 @@ jobs:
           done
 
       # ML Kit's text recognition requires API 21 or above. Recent Flutter
-      # templates already default to 21+, so this is usually a no-op â€” but it
+      # templates already default to 21+, so this is usually a no-op — but it
       # is cheap insurance and handles both the Groovy and Kotlin Gradle DSLs.
       - name: Pin minSdk for ML Kit
         run: |
@@ -219,7 +219,7 @@ jobs:
 
       # Analyzer and tests are informational, not gates. This source has never
       # been compiled, so the first few runs are expected to surface real
-      # errors â€” but a lint warning should not stop you getting an APK, and
+      # errors — but a lint warning should not stop you getting an APK, and
       # the build step below is the honest test of whether it compiles.
       - name: Analyze
         continue-on-error: true
@@ -231,7 +231,7 @@ jobs:
 
       # Flutter's generated build.gradle signs release builds with the debug
       # key when no signing config is supplied, so this APK installs directly
-      # on a phone. It is NOT suitable for the Play Store â€” that needs a real
+      # on a phone. It is NOT suitable for the Play Store — that needs a real
       # upload key.
       - name: Build release APK
         run: flutter build apk --release
@@ -252,6 +252,24 @@ jobs:
       # If the release build failed, try a debug build anyway. Debug APKs are
       # larger and slower but install and run fine, and getting *something*
       # onto the phone beats getting nothing while errors are ironed out.
+      # R8 writes the exact keep rules it needs to a file. Capturing it means a
+      # future attempt to re-enable minification starts from facts rather than
+      # from guessing which transitive class went missing.
+      - name: Capture R8 diagnostics
+        if: failure()
+        run: |
+          RULES=build/app/outputs/mapping/release/missing_rules.txt
+          if [ -f "$RULES" ]; then
+            echo "=== R8 generated these keep rules ==="
+            cat "$RULES"
+          else
+            echo "No missing_rules.txt - the failure was not R8 keep rules."
+          fi
+          echo "=== release build type configuration ==="
+          tail -25 android/app/build.gradle.kts 2>/dev/null \
+            || tail -20 android/app/build.gradle 2>/dev/null \
+            || true
+
       - name: Fall back to a debug APK
         if: failure()
         run: |
