@@ -157,10 +157,18 @@ jobs:
       # this runner, which is destroyed when the job ends.
       - name: Restore the keystore
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > upload-keystore.jks
+          # The keystore is written into android/app/ and referenced by bare
+          # filename. Gradle's file() inside android/app/build.gradle.kts
+          # resolves relative paths against that directory, so this needs no
+          # absolute path and no $GITHUB_WORKSPACE — both of which are easy to
+          # get subtly wrong and produce "Keystore file not found" after a
+          # six-minute build.
+          mkdir -p android/app
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/app/upload-keystore.jks
+          ls -l android/app/upload-keystore.jks
 
           # Check 1: is this a keystore at all, and is the password right?
-          if ! keytool -list -keystore upload-keystore.jks \
+          if ! keytool -list -keystore android/app/upload-keystore.jks \
                -storepass "${{ secrets.KEYSTORE_PASSWORD }}" >/dev/null 2>&1; then
             echo "::error::Could not open the keystore. Either KEYSTORE_BASE64 is corrupt (re-copy it with base64 -w 0, no line breaks) or KEYSTORE_PASSWORD is wrong."
             exit 1
@@ -177,7 +185,7 @@ jobs:
           # keytool -list prints every alias. Comparing here means a mismatch
           # costs seconds instead of six minutes, and the log can show which
           # aliases DO exist without revealing the secret.
-          ALIASES=$(keytool -list -keystore upload-keystore.jks \
+          ALIASES=$(keytool -list -keystore android/app/upload-keystore.jks \
                     -storepass "${{ secrets.KEYSTORE_PASSWORD }}" 2>/dev/null \
                     | grep -i "PrivateKeyEntry\|trustedCertEntry" \
                     | sed 's/,.*//' | tr -d ' ')
@@ -200,7 +208,7 @@ jobs:
           #
           # Practical consequence: if signing complains about the key
           # password, set KEY_PASSWORD to the same value as KEYSTORE_PASSWORD.
-          if ! keytool -list -keystore upload-keystore.jks \
+          if ! keytool -list -keystore android/app/upload-keystore.jks \
                -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
                -alias "${{ secrets.KEY_ALIAS }}" >/dev/null 2>&1; then
             echo "::error::The alias exists but could not be read from the keystore."
@@ -210,18 +218,28 @@ jobs:
           # Warn if the two password secrets differ, since on PKCS12 only the
           # store password is actually used.
           if [ "${{ secrets.KEY_PASSWORD }}" != "${{ secrets.KEYSTORE_PASSWORD }}" ]; then
-            STORETYPE=$(keytool -list -keystore upload-keystore.jks \
+            STORETYPE=$(keytool -list -keystore android/app/upload-keystore.jks \
                         -storepass "${{ secrets.KEYSTORE_PASSWORD }}" 2>/dev/null \
                         | grep -i "Keystore type" | head -1)
             echo "::warning::KEY_PASSWORD differs from KEYSTORE_PASSWORD. $STORETYPE — PKCS12 keystores ignore separate key passwords. If signing fails, set both secrets to the same value."
           fi
 
-          cat > android/key.properties <<PROPS
-          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
-          keyPassword=${{ secrets.KEY_PASSWORD }}
-          keyAlias=${{ secrets.KEY_ALIAS }}
-          storeFile=$GITHUB_WORKSPACE/release.jks
-          PROPS
+          # printf rather than a heredoc: a heredoc inside a YAML block
+          # scalar writes the YAML indentation into the file, so every line
+          # starts with spaces. The Kotlin parser trims them, but shell tools
+          # anchoring on '^storeFile=' silently match nothing.
+          {
+            printf 'storePassword=%s\n' "${{ secrets.KEYSTORE_PASSWORD }}"
+            printf 'keyPassword=%s\n'   "${{ secrets.KEY_PASSWORD }}"
+            printf 'keyAlias=%s\n'      "${{ secrets.KEY_ALIAS }}"
+            printf 'storeFile=%s\n'     'upload-keystore.jks'
+          } > android/key.properties
+
+          echo "key.properties written (passwords redacted):"
+          sed 's/\(Password=\).*/\1REDACTED/' android/key.properties | sed 's/^/    /'
+          echo "no leading whitespace check:"
+          grep -q '^storeFile=' android/key.properties && echo "    OK" || {
+            echo "::error::storeFile line is malformed."; exit 1; }
 
           echo "Keystore restored, alias verified, key readable."
 
@@ -256,6 +274,35 @@ jobs:
         continue-on-error: true
         run: flutter test
 
+      # Gradle's own "Keystore file not found" appears only at the signing
+      # task, roughly six minutes in. Resolving the same path here turns that
+      # into a two-second failure with the directory listing attached.
+      - name: Confirm Gradle will find the keystore
+        run: |
+          set -eu
+          test -f android/key.properties || {
+            echo "::error::android/key.properties is missing."; exit 1; }
+
+          # Tolerant of leading whitespace, in case key.properties was
+          # written by hand rather than by this workflow.
+          STORE=$(sed -n 's/^[[:space:]]*storeFile=//p' android/key.properties | tr -d ' \r')
+
+          # Mirror Gradle's file() resolution: relative paths resolve against
+          # the module directory, android/app/.
+          case "$STORE" in
+            /*) RESOLVED="$STORE" ;;
+             *) RESOLVED="android/app/$STORE" ;;
+          esac
+
+          if [ ! -f "$RESOLVED" ]; then
+            echo "::error::Gradle will look for the keystore at '$RESOLVED' and it is not there."
+            echo "--- android/app/ ---"; ls -la android/app/ || true
+            echo "--- key.properties (passwords redacted) ---"
+            sed 's/\(Password=\).*/\1REDACTED/' android/key.properties
+            exit 1
+          fi
+          echo "Keystore present at $RESOLVED ($(stat -c%s "$RESOLVED") bytes)"
+
       - name: Build the app bundle
         run: flutter build appbundle --release
 
@@ -288,5 +335,5 @@ jobs:
       - name: Remove the keystore
         if: always()
         run: |
-          rm -f upload-keystore.jks android/key.properties
+          rm -f android/app/upload-keystore.jks android/key.properties
           echo "Signing material removed from the runner."
