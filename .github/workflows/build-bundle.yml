@@ -220,7 +220,7 @@ jobs:
           storePassword=${{ secrets.KEYSTORE_PASSWORD }}
           keyPassword=${{ secrets.KEY_PASSWORD }}
           keyAlias=${{ secrets.KEY_ALIAS }}
-          storeFile=$GITHUB_WORKSPACE/upload-keystore.jks
+          storeFile=$GITHUB_WORKSPACE/release.jks
           PROPS
 
           echo "Keystore restored, alias verified, key readable."
